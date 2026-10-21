@@ -1,4 +1,7 @@
+import os
 import asyncio
+import logging
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
@@ -6,14 +9,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ══════════════════════════════════════════════
-# ВСТАВЬ СВОЙ ТОКЕН СЮДА (между кавычками):
-BOT_TOKEN = "8654279425:AAFhm3JVMp2b1mIXHWyWwmAHW3hndMaTodI"
-# ══════════════════════════════════════════════
+# Включаем логирование, чтобы видеть ошибки в консоли Render
+logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
+# Получаем токен из переменных окружения
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 class Diag(StatesGroup):
     niche = State()
@@ -24,167 +24,99 @@ class Diag(StatesGroup):
     content = State()
     funnel = State()
 
+dp = Dispatcher()
+
+# --- ТВОИ ХЕНДЛЕРЫ (логика бота) ---
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "👋 Привет! Я бот-диагност для бизнеса.\n\n"
-        "За 2 минуты разберу, что стопорит рост, "
-        "и дам план действий.\n\n"
-        "📌 Напиши свою нишу (чем занимаешься?):"
-    )
+    await message.answer("👋 Привет! Я бот-диагност для бизнеса.\n\n📌 Напиши свою нишу:")
     await state.set_state(Diag.niche)
-
 
 @dp.message(Diag.niche)
 async def q1(message: Message, state: FSMContext):
     await state.update_data(niche=message.text)
-    await message.answer(
-        "✅ Ок!\n\n"
-        "📌 Какие главные трудности сейчас?\n"
-        "(напиши 1-3 предложения)"
-    )
+    await message.answer("📌 Какие главные трудности сейчас?")
     await state.set_state(Diag.problems)
-
 
 @dp.message(Diag.problems)
 async def q2(message: Message, state: FSMContext):
     await state.update_data(problems=message.text)
-    await message.answer(
-        "✅ Понял!\n\n"
-        "📌 Какой результат хочешь получить?\n"
-        "(например: x3 к выручке за 3 месяца)"
-    )
+    await message.answer("📌 Какой результат хочешь получить?")
     await state.set_state(Diag.goal)
-
 
 @dp.message(Diag.goal)
 async def q3(message: Message, state: FSMContext):
     await state.update_data(goal=message.text)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Да", callback_data="yes")
-    kb.button(text="❌ Нет", callback_data="no")
-    kb.adjust(2)
-    await message.answer(
-        "Финальные вопросы — жми кнопку 👇\n\n"
-        "📌 Устраивает текущее количество заявок?",
-        reply_markup=kb.as_markup()
-    )
+    kb.button(text="✅ Да", callback_data="yes"), kb.button(text="❌ Нет", callback_data="no")
+    await message.answer("📌 Устраивает количество заявок?", reply_markup=kb.as_markup())
     await state.set_state(Diag.leads)
 
-
-@dp.callback_query(Diag.leads, F.data.in_({"yes", "no"}))
+@dp.callback_query(Diag.leads)
 async def q4(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
     await state.update_data(leads=cb.data)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Да", callback_data="yes")
-    kb.button(text="❌ Нет", callback_data="no")
-    kb.adjust(2)
-    await cb.message.edit_text(
-        "📌 Есть система продаж? (скрипты, CRM)",
-        reply_markup=kb.as_markup()
-    )
+    kb.button(text="✅ Да", callback_data="yes"), kb.button(text="❌ Нет", callback_data="no")
+    await cb.message.edit_text("📌 Есть система продаж?", reply_markup=kb.as_markup())
     await state.set_state(Diag.sales)
 
-
-@dp.callback_query(Diag.sales, F.data.in_({"yes", "no"}))
+@dp.callback_query(Diag.sales)
 async def q5(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
     await state.update_data(sales=cb.data)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Да", callback_data="yes")
-    kb.button(text="❌ Нет", callback_data="no")
-    kb.adjust(2)
-    await cb.message.edit_text(
-        "📌 Ведёшь соцсети регулярно? (3+ поста в неделю)",
-        reply_markup=kb.as_markup()
-    )
+    kb.button(text="✅ Да", callback_data="yes"), kb.button(text="❌ Нет", callback_data="no")
+    await cb.message.edit_text("📌 Ведёшь соцсети регулярно?", reply_markup=kb.as_markup())
     await state.set_state(Diag.content)
 
-
-@dp.callback_query(Diag.content, F.data.in_({"yes", "no"}))
+@dp.callback_query(Diag.content)
 async def q6(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
     await state.update_data(content=cb.data)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Да", callback_data="yes")
-    kb.button(text="❌ Нет", callback_data="no")
-    kb.adjust(2)
-    await cb.message.edit_text(
-        "📌 Есть воронка? (лид-магнит → прогрев → продажа)",
-        reply_markup=kb.as_markup()
-    )
+    kb.button(text="✅ Да", callback_data="yes"), kb.button(text="❌ Нет", callback_data="no")
+    await cb.message.edit_text("📌 Есть воронка?", reply_markup=kb.as_markup())
     await state.set_state(Diag.funnel)
 
-
-@dp.callback_query(Diag.funnel, F.data.in_({"yes", "no"}))
+@dp.callback_query(Diag.funnel)
 async def q7(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.update_data(funnel=cb.data)
     data = await state.get_data()
-    result = make_diagnosis(data)
     await cb.message.edit_text("⏳ Анализирую...")
-    await asyncio.sleep(2)
-    await cb.message.answer(result)
+    await asyncio.sleep(1)
+    # Упрощенный вывод для теста
+    res = f"📊 Результат для ниши {data.get('niche')}:\nНужно больше воронки! Пиши @Malvitosa"
+    await cb.message.answer(res)
     await state.clear()
 
+# --- СЕРВЕРНАЯ ЧАСТЬ ДЛЯ RENDER ---
 
-def make_diagnosis(d):
-    issues = []
-    tips = []
-
-    if d.get("leads") == "no":
-        issues.append("🔴 Мало заявок")
-        tips.append("→ Запусти таргет + рилс-воронку")
-    else:
-        issues.append("🟢 Заявки — ок")
-
-    if d.get("sales") == "no":
-        issues.append("🔴 Нет системы продаж")
-        tips.append("→ Внедри CRM + скрипты")
-    else:
-        issues.append("🟢 Продажи — ок")
-
-    if d.get("content") == "no":
-        issues.append("🔴 Нет регулярного контента")
-        tips.append("→ Контент-план + автопостинг")
-    else:
-        issues.append("🟢 Контент — ок")
-
-    if d.get("funnel") == "no":
-        issues.append("🔴 Нет воронки")
-        tips.append("→ Собери автоворонку в боте")
-    else:
-        issues.append("🟢 Воронка — ок")
-
-    reds = sum(1 for i in issues if "🔴" in i)
-    if reds == 0:
-        verdict = "🏆 Крепкая база! Масштабируй."
-    elif reds <= 2:
-        verdict = "⚠️ 1-2 узких места съедают прибыль."
-    else:
-        verdict = "🚨 Бизнес на ручнике. Нужна система."
-
-    return (
-        f"📊 РЕЗУЛЬТАТЫ ДИАГНОСТИКИ\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷 Ниша: {d.get('niche')}\n"
-        f"🎯 Цель: {d.get('goal')}\n\n"
-        f"🔍 Что стопорит:\n" +
-        "\n".join(issues) +
-        f"\n\n🩺 Вердикт: {verdict}\n\n"
-        f"📋 План действий:\n" +
-        "\n".join(tips) +
-        "\n\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"💬 Хочешь разобрать детально? "
-        f"Пиши @your_username"
-    )
-
+async def handle(request):
+    return web.Response(text="Bot is running")
 
 async def main():
-    print("✅ Бот запущен! Не закрывай это окно.")
-    await dp.start_polling(bot)
+    if not BOT_TOKEN:
+        print("❌ ОШИБКА: BOT_TOKEN не найден в настройках Environment Variables!")
+        return
 
-asyncio.run(main())
+    bot = Bot(token=BOT_TOKEN)
+    
+    # Создаем веб-сервер, чтобы Render был доволен
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Берем порт, который дает Render, или 8080 по умолчанию
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    print(f"✅ Сервер запущен на порту {port}")
+    
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        print(f"❌ Ошибка при запуске бота: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())

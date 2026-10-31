@@ -6,7 +6,7 @@ from datetime import datetime
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, BotCommand
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -413,10 +413,19 @@ async def finish_diagnostic(message: Message, state: FSMContext):
 async def handle(request):
     return web.Response(text="Bot is running")
 
+async def setup_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="🚀 Перезапустить бота / Начать сначала")
+    ]
+    await bot.set_my_commands(commands)
+
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN не найден!")
         return
+
+    # Устанавливаем синюю кнопку «Меню» внизу
+    await setup_bot_commands(bot)
 
     app = web.Application()
     app.router.add_get("/", handle)

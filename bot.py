@@ -224,7 +224,7 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "👋 Привет! Я бот-диагност для бизнеса.\n\n"
         "За 2 минуты разберем, что стопорит рост, и определим точки роста.\n\n"
-        "📌 <b>1/4. Напишите Вашу нишу</b> (чем занимается ваш бизнес?):",
+        "📌 <b>1/4. Напишите Вашу нишу</b> (чем занимается Ваш бизнес?):",
         parse_mode="HTML"
     )
     await state.set_state(Diag.niche)

@@ -300,7 +300,7 @@ async def send_next_question(message: Message, state: FSMContext):
     
     # Если ответили на все 7 вопросов -> ЗАВЕРШАЕМ
     if q_index >= len(questions):
-        await finish_diagnostic(message, state)
+        await finish_diagnostic(message, state, user_object=message.chat)
         return
 
     q_data = questions[q_index]
@@ -364,14 +364,17 @@ async def process_custom_answer(message: Message, state: FSMContext):
 
 
 # ─── ФИНАЛ ──────────────────────────────────────────────
-async def finish_diagnostic(message: Message, state: FSMContext):
+async def finish_diagnostic(message: Message, state: FSMContext, user_object=None):
     data = await state.get_data()
-    user = message.from_user
+    
+    # ПРАВИЛЬНЫЙ СПОСОБ: 
+    # Если мы пришли из колбэка, берем информацию о чате (это и есть юзер)
+    user = user_object if user_object else message.from_user
     
     user_info = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "username": f"@{user.username}" if user.username else "Нет юзернейма",
-        "full_name": user.full_name
+        "full_name": user.full_name if hasattr(user, 'full_name') else f"{user.first_name} {user.last_name or ''}"
     }
 
     # 1. Запись в Google Sheets
@@ -398,10 +401,10 @@ async def finish_diagnostic(message: Message, state: FSMContext):
         except Exception as e:
             logging.error(f"Не удалось отправить сообщение админу: {e}")
 
-    # 3. Финальный текст КЛИЕНТУ (из вашего слайда)
+    # 3. Финальный текст КЛИЕНТУ
     final_text = (
-        "Спасибо за Ваши ответы! 🎉\n\n"
-        "Я изучу их и напишу Вам, на что стоит обратить внимание в первую очередь "
+        "Спасибо за ваши ответы! 🎉\n\n"
+        "Я изучу их и напишу вам, на что стоит обратить внимание в первую очередь "
         "и какие моменты стоит разобрать подробнее, чтобы понять, почему нет желаемого результата."
     )
     

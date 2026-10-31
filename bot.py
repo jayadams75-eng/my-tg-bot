@@ -427,13 +427,7 @@ async def main():
         logging.error("❌ BOT_TOKEN не найден!")
         return
 
-    # 1. Устанавливаем команды (меню)
-    try:
-        await bot.set_my_commands([BotCommand(command="start", description="🚀 Начать сначала")])
-    except Exception as e:
-        logging.error(f"Ошибка установки команд: {e}")
-
-    # 2. Запускаем веб-сервер (для Render)
+    # 1. Создаем веб-сервер (для Render), чтобы он не убивал бота
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="ok"))
     runner = web.AppRunner(app)
@@ -441,15 +435,29 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    
     logging.info(f"✅ Сервер запущен на порту {port}")
 
-    # 3. Запускаем бота
+    # 2. Установка команд меню (в фоновом режиме, чтобы не тормозить запуск)
+    async def set_commands():
+        try:
+            await bot.set_my_commands([BotCommand(command="start", description="🚀 Начать сначала")])
+            logging.info("✅ Кнопка Меню установлена")
+        except Exception as e:
+            logging.error(f"⚠️ Не удалось установить команды: {e}")
+
+    asyncio.create_task(set_commands())
+
+    # 3. Запуск самого бота
+    logging.info("🚀 Запуск Polling (слушаем сообщения)...")
     try:
-        logging.info("🚀 Запуск Polling...")
+        # Удаляем старые вебхуки, чтобы они не мешали (частая причина зависаний)
+        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     except Exception as e:
-        logging.error(f"❌ Критическая ошибка при работе бота: {e}")
+        logging.error(f"❌ Ошибка Polling: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен")

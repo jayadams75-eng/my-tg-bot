@@ -2,12 +2,13 @@ import os
 import asyncio
 import logging
 import json
+import html
 from datetime import datetime
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, BotCommand
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -16,13 +17,31 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO)
+# Чтобы самопинг не засорял логи строками "GET /"
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = os.environ.get("ADMIN_ID")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
 
+# Публичный адрес сервиса. На Render переменная RENDER_EXTERNAL_URL
+# подставляется автоматически; можно переопределить через KEEPALIVE_URL.
+KEEPALIVE_URL = (
+    os.environ.get("KEEPALIVE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or "https://my-tg-bot-0nhz.onrender.com"
+)
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_INTERVAL", "300"))  # секунд
+
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
-dp = Dispatcher()
+
+# SimpleEventIsolation не даёт обработать два нажатия одного пользователя одновременно
+try:
+    from aiogram.fsm.storage.memory import SimpleEventIsolation
+
+    dp = Dispatcher(events_isolation=SimpleEventIsolation())
+except (ImportError, TypeError):
+    dp = Dispatcher()
 
 
 # ─── СОСТОЯНИЯ (FSM) ────────────────────────────────────
@@ -189,11 +208,11 @@ def save_to_google_sheets(data: dict, user_info: dict):
         creds_dict = json.loads(GOOGLE_CREDS_JSON)
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
-        
+
         sheet = client.open("Лиды Диагностика").sheet1
-        
+
         answers = data.get("answers", [])
-        
+
         row = [
             user_info.get("date"),
             user_info.get("username"),
@@ -216,11 +235,32 @@ def save_to_google_sheets(data: dict, user_info: dict):
         logging.error(f"❌ Ошибка записи в Таблицу: {e}")
 
 
+# ─── ВСПОМОГАТЕЛЬНОЕ ────────────────────────────────────
+async def mark_answered(cb: CallbackQuery, choice_text: str):
+    """Убирает кнопки у отвеченного вопроса и дописывает выбранный ответ."""
+    try:
+        await cb.message.edit_text(
+            f"{cb.message.html_text}\n\n✅ <b>Ваш ответ:</b> {html.escape(choice_text)}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отметить ответ в сообщении: {e}")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 # ─── ЛОГИКА ОПРОСА ──────────────────────────────────────
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
+    user = message.from_user
+    await state.update_data(
+        tg_username=f"@{user.username}" if user and user.username else "Нет юзернейма",
+        tg_full_name=user.full_name if user else ""
+    )
     await message.answer(
         "👋 Привет! Я бот-диагност для бизнеса.\n\n"
         "За 2 минуты разберем, что стопорит рост, и определим точки роста.\n\n"
@@ -230,7 +270,7 @@ async def start(message: Message, state: FSMContext):
     await state.set_state(Diag.niche)
 
 
-@dp.message(Diag.niche)
+@dp.message(Diag.niche, F.text)
 async def process_niche(message: Message, state: FSMContext):
     await state.update_data(niche=message.text)
     await message.answer(
@@ -241,7 +281,7 @@ async def process_niche(message: Message, state: FSMContext):
     await state.set_state(Diag.problems)
 
 
-@dp.message(Diag.problems)
+@dp.message(Diag.problems, F.text)
 async def process_problems(message: Message, state: FSMContext):
     await state.update_data(problems=message.text)
     await message.answer(
@@ -252,10 +292,10 @@ async def process_problems(message: Message, state: FSMContext):
     await state.set_state(Diag.goal)
 
 
-@dp.message(Diag.goal)
+@dp.message(Diag.goal, F.text)
 async def process_goal(message: Message, state: FSMContext):
     await state.update_data(goal=message.text)
-    
+
     kb = InlineKeyboardBuilder()
     kb.button(text="👤 Работаю один", callback_data="team_solo")
     kb.button(text="👥 2-6 человек", callback_data="team_small")
@@ -273,7 +313,7 @@ async def process_goal(message: Message, state: FSMContext):
 @dp.callback_query(Diag.team_size, F.data.startswith("team_"))
 async def process_team_size(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    
+
     choice = cb.data
     if choice == "team_solo":
         team_str = "Работаю один"
@@ -287,149 +327,235 @@ async def process_team_size(cb: CallbackQuery, state: FSMContext):
 
     await state.update_data(team_size=team_str, branch=branch, q_index=0, answers=[])
     await state.set_state(Diag.answering_questions)
-    
-    await send_next_question(cb.message, state)
+
+    await mark_answered(cb, team_str)
+    await send_next_question(cb.from_user.id, state)
 
 
-async def send_next_question(message: Message, state: FSMContext):
+async def send_next_question(chat_id: int, state: FSMContext):
     data = await state.get_data()
     q_index = data.get("q_index", 0)
     branch = data.get("branch")
-    
+
     questions = SOLO_QUESTIONS if branch == "solo" else TEAM_QUESTIONS
-    
-    # Если ответили на все 7 вопросов -> ЗАВЕРШАЕМ
+
+    # Если ответили на все вопросы -> ЗАВЕРШАЕМ
     if q_index >= len(questions):
-        await finish_diagnostic(message, state, user_object=message.chat)
+        await finish_diagnostic(chat_id, state)
         return
 
     q_data = questions[q_index]
-    
-    # Формируем текст сообщения
-    text = f"<b>Вопрос {q_index + 1} из 7:</b>\n"
+
+    text = f"<b>Вопрос {q_index + 1} из {len(questions)}:</b>\n"
     text += f"<b>{q_data['title']}</b>\n\n"
-    
+
     kb = InlineKeyboardBuilder()
-    
-    # Добавляем варианты в текст и создаем кнопки
+
     for code, opt_text in q_data["options"].items():
         text += f"{opt_text}\n\n"
-        # Буква кнопки (А, Б, В...)
         letter = opt_text.split(".")[0]
-        kb.button(text=f"Вариант {letter}", callback_data=f"ans_{code}")
-        
-    kb.button(text="✏️ Свой вариант", callback_data="ans_custom")
+        # В callback_data зашит номер вопроса: старые/повторные нажатия не собьют ответы
+        kb.button(text=f"Вариант {letter}", callback_data=f"ans:{q_index}:{code}")
+
+    kb.button(text="✏️ Свой вариант", callback_data=f"ans:{q_index}:custom")
     kb.adjust(2)  # По 2 кнопки в ряд
 
-    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
-@dp.callback_query(Diag.answering_questions, F.data.startswith("ans_"))
+@dp.callback_query(
+    StateFilter(Diag.answering_questions, Diag.waiting_custom_answer),
+    F.data.startswith("ans:")
+)
 async def handle_answer(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    code = cb.data.replace("ans_", "")
-    
-    if code == "custom":
-        await cb.message.answer("⌨️ <b>Напишите ваш вариант ответа текстом:</b>", parse_mode="HTML")
-        await state.set_state(Diag.waiting_custom_answer)
+    try:
+        _, idx_str, code = cb.data.split(":", 2)
+        idx = int(idx_str)
+    except ValueError:
+        await cb.answer()
         return
 
     data = await state.get_data()
     q_index = data.get("q_index", 0)
     branch = data.get("branch")
     questions = SOLO_QUESTIONS if branch == "solo" else TEAM_QUESTIONS
-    
-    selected_text = questions[q_index]["options"].get(code, "Выбран вариант")
-    
-    answers = data.get("answers", [])
+
+    # Нажали кнопку от уже пройденного вопроса (повторный тап / старое сообщение)
+    if idx != q_index or q_index >= len(questions):
+        await cb.answer("Этот вопрос уже пройден.")
+        return
+
+    if code == "custom":
+        await cb.answer()
+        await bot.send_message(
+            cb.from_user.id,
+            "⌨️ <b>Напишите ваш вариант ответа текстом:</b>",
+            parse_mode="HTML"
+        )
+        await state.set_state(Diag.waiting_custom_answer)
+        return
+
+    selected_text = questions[q_index]["options"].get(code)
+    if selected_text is None:
+        await cb.answer()
+        return
+
+    await cb.answer()
+
+    answers = list(data.get("answers", []))
     answers.append(selected_text)
-    
+
+    await state.set_state(Diag.answering_questions)
     await state.update_data(answers=answers, q_index=q_index + 1)
-    await send_next_question(cb.message, state)
+
+    await mark_answered(cb, selected_text)
+    await send_next_question(cb.from_user.id, state)
 
 
-@dp.message(Diag.waiting_custom_answer)
+@dp.message(Diag.waiting_custom_answer, F.text)
 async def process_custom_answer(message: Message, state: FSMContext):
-    custom_text = f"Свой вариант: {message.text}"
-    
     data = await state.get_data()
     q_index = data.get("q_index", 0)
-    answers = data.get("answers", [])
-    answers.append(custom_text)
-    
-    await state.update_data(answers=answers, q_index=q_index + 1)
+    answers = list(data.get("answers", []))
+    answers.append(f"Свой вариант: {message.text}")
+
     await state.set_state(Diag.answering_questions)
-    
-    await send_next_question(message, state)
+    await state.update_data(answers=answers, q_index=q_index + 1)
+
+    await send_next_question(message.chat.id, state)
 
 
 # ─── ФИНАЛ ──────────────────────────────────────────────
-async def finish_diagnostic(message: Message, state: FSMContext, user_object=None):
+async def finish_diagnostic(chat_id: int, state: FSMContext):
     data = await state.get_data()
-    
-    # ПРАВИЛЬНЫЙ СПОСОБ: 
-    # Если мы пришли из колбэка, берем информацию о чате (это и есть юзер)
-    user = user_object if user_object else message.from_user
-    
+    # Сразу очищаем состояние: повторное завершение невозможно
+    await state.clear()
+
     user_info = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "username": f"@{user.username}" if user.username else "Нет юзернейма",
-        "full_name": user.full_name if hasattr(user, 'full_name') else f"{user.first_name} {user.last_name or ''}"
+        "username": data.get("tg_username", "Нет юзернейма"),
+        "full_name": data.get("tg_full_name", "")
     }
+    answers = data.get("answers", [])
 
-    # 1. Запись в Google Sheets
-    asyncio.create_task(asyncio.to_thread(save_to_google_sheets, data, user_info))
-
-    # 2. Уведомление АДМИНУ
+    # 1. Уведомление АДМИНУ (HTML с экранированием; если не вышло — простой текст)
     if ADMIN_ID:
-        answers_str = ""
-        for i, ans in enumerate(data.get("answers", []), 1):
-            answers_str += f"<b>В{i}:</b> {ans}\n"
+        fields = [
+            ("👤", "Клиент", f"{user_info['full_name']} ({user_info['username']})"),
+            ("🏷", "Ниша", data.get("niche")),
+            ("❓", "Трудности", data.get("problems")),
+            ("🎯", "Цель", data.get("goal")),
+            ("👥", "Команда", data.get("team_size")),
+        ]
+        html_lines = ["🔥 <b>НОВАЯ ДИАГНОСТИКА В БОТЕ!</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        plain_lines = ["🔥 НОВАЯ ДИАГНОСТИКА В БОТЕ!", "━━━━━━━━━━━━━━━━━━━━"]
+        for emoji, label, value in fields:
+            value = str(value or "")
+            html_lines.append(f"{emoji} <b>{label}:</b> {html.escape(value)}")
+            plain_lines.append(f"{emoji} {label}: {value}")
+        html_lines += ["", "📋 <b>ОТВЕТЫ:</b>"]
+        plain_lines += ["", "📋 ОТВЕТЫ:"]
+        for i, ans in enumerate(answers, 1):
+            html_lines.append(f"<b>В{i}:</b> {html.escape(ans)}")
+            plain_lines.append(f"В{i}: {ans}")
 
-        admin_msg = (
-            f"🔥 <b>НОВАЯ ДИАГНОСТИКА В БОТЕ!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Клиент:</b> {user_info['full_name']} ({user_info['username']})\n"
-            f"🏷 <b>Ниша:</b> {data.get('niche')}\n"
-            f"❓ <b>Трудности:</b> {data.get('problems')}\n"
-            f"🎯 <b>Цель:</b> {data.get('goal')}\n"
-            f"👥 <b>Команда:</b> {data.get('team_size')}\n\n"
-            f"📋 <b>ОТВЕТЫ:</b>\n{answers_str}"
-        )
+        html_msg = "\n".join(html_lines)
+        plain_msg = "\n".join(plain_lines)
+
         try:
-            await bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode="HTML")
+            if len(html_msg) > 4096:
+                raise ValueError("сообщение длиннее лимита Telegram")
+            await bot.send_message(chat_id=ADMIN_ID, text=html_msg, parse_mode="HTML")
         except Exception as e:
-            logging.error(f"Не удалось отправить сообщение админу: {e}")
+            logging.warning(f"HTML-уведомление админу не ушло ({e}), отправляю простым текстом")
+            try:
+                for i in range(0, len(plain_msg), 4000):
+                    await bot.send_message(chat_id=ADMIN_ID, text=plain_msg[i:i + 4000])
+            except Exception as e2:
+                logging.error(f"Не удалось отправить сообщение админу: {e2}")
 
-    # 3. Финальный текст КЛИЕНТУ
+    # 2. Финальный текст КЛИЕНТУ
     final_text = (
         "Спасибо за ваши ответы! 🎉\n\n"
         "Я изучу их и напишу вам, на что стоит обратить внимание в первую очередь "
         "и какие моменты стоит разобрать подробнее, чтобы понять, почему нет желаемого результата."
     )
-    
-    await message.answer(final_text)
-    await state.clear()
+    await bot.send_message(chat_id, final_text)
+
+    # 3. Запись в Google Sheets (ждём завершения, а не бросаем в фон,
+    #    чтобы перезапуск процесса не оборвал запись)
+    await asyncio.to_thread(save_to_google_sheets, data, user_info)
 
 
-# ─── ВЕБ-СЕРВЕР DUMMY ДЛЯ RENDER ─────────────────────────
-async def handle(request):
-    return web.Response(text="Bot is running")
+# ─── ЗАПАСНЫЕ ОБРАБОТЧИКИ (регистрируются последними!) ───
+# Если бот перезапустился, состояние в памяти пропало: вместо молчания
+# пользователь получает понятную подсказку.
+@dp.callback_query()
+async def stale_callback(cb: CallbackQuery):
+    await cb.answer(
+        "Эта кнопка уже неактивна (возможно, бот перезапускался). "
+        "Нажмите /start, чтобы начать заново.",
+        show_alert=True
+    )
 
-async def setup_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="🚀 Перезапустить бота / Начать сначала")
-    ]
-    await bot.set_my_commands(commands)
+
+@dp.message()
+async def fallback_message(message: Message, state: FSMContext):
+    current = await state.get_state()
+    text_states = (
+        Diag.niche.state, Diag.problems.state, Diag.goal.state, Diag.waiting_custom_answer.state
+    )
+    if current in text_states:
+        await message.answer("Пожалуйста, ответьте текстовым сообщением.")
+    elif current == Diag.team_size.state:
+        await message.answer("Выберите вариант кнопкой под вопросом. Чтобы начать заново — /start.")
+    elif current == Diag.answering_questions.state:
+        await message.answer(
+            "Выберите вариант кнопкой под вопросом или нажмите «✏️ Свой вариант». "
+            "Чтобы начать заново — /start."
+        )
+    else:
+        await message.answer("Чтобы пройти диагностику, нажмите /start")
+
+
+# ─── ВЕБ-СЕРВЕР ДЛЯ RENDER И САМОПИНГ ────────────────────
+async def health(request):
+    return web.Response(text="ok")
+
+
+async def keep_alive():
+    """Раз в KEEPALIVE_INTERVAL секунд обращается к собственному публичному адресу.
+    Для Render это входящий трафик, поэтому бесплатный сервис не засыпает."""
+    if not KEEPALIVE_URL:
+        logging.info("Самопинг выключен: адрес сервиса не задан")
+        return
+
+    ok_logged = False
+    await asyncio.sleep(60)
+    async with ClientSession(timeout=ClientTimeout(total=20)) as session:
+        while True:
+            try:
+                async with session.get(KEEPALIVE_URL) as resp:
+                    if resp.status < 400:
+                        if not ok_logged:
+                            logging.info(f"✅ Самопинг работает ({KEEPALIVE_URL})")
+                            ok_logged = True
+                    else:
+                        logging.warning(f"⚠️ Самопинг: ответ {resp.status}")
+            except Exception as e:
+                logging.warning(f"⚠️ Самопинг не удался: {e}")
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+
 
 async def main():
     if not BOT_TOKEN:
         logging.error("❌ BOT_TOKEN не найден!")
         return
 
-    # 1. Создаем веб-сервер (для Render), чтобы он не убивал бота
+    # 1. Веб-сервер (Render должен увидеть открытый порт)
     app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
@@ -437,27 +563,31 @@ async def main():
     await site.start()
     logging.info(f"✅ Сервер запущен на порту {port}")
 
-    # 2. Установка команд меню (в фоновом режиме, чтобы не тормозить запуск)
-    async def set_commands():
-        try:
-            await bot.set_my_commands([BotCommand(command="start", description="🚀 Начать сначала")])
-            logging.info("✅ Кнопка Меню установлена")
-        except Exception as e:
-            logging.error(f"⚠️ Не удалось установить команды: {e}")
-
-    asyncio.create_task(set_commands())
-
-    # 3. Запуск самого бота
-    logging.info("🚀 Запуск Polling (слушаем сообщения)...")
+    # 2. Кнопка меню
     try:
-        # Удаляем старые вебхуки, чтобы они не мешали (частая причина зависаний)
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        await bot.set_my_commands([BotCommand(command="start", description="🚀 Начать сначала")])
+        logging.info("✅ Кнопка Меню установлена")
     except Exception as e:
-        logging.error(f"❌ Ошибка Polling: {e}")
+        logging.error(f"Ошибка установки команд: {e}")
+
+    # 3. Самопинг, чтобы Render не усыплял сервис
+    keepalive_task = asyncio.create_task(keep_alive())
+
+    # 4. Polling. Штатная остановка (SIGTERM от Render) возвращает управление
+    #    без ошибки; любая реальная ошибка — повторный запуск через 5 секунд.
+    try:
+        while True:
+            try:
+                logging.info("🚀 Запуск Polling...")
+                await dp.start_polling(bot)
+                break
+            except Exception:
+                logging.exception("❌ Ошибка polling, перезапуск через 5 секунд")
+                await asyncio.sleep(5)
+    finally:
+        keepalive_task.cancel()
+        await runner.cleanup()
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен")
+    asyncio.run(main())

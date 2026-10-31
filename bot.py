@@ -424,22 +424,32 @@ async def setup_bot_commands(bot: Bot):
 
 async def main():
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN не найден!")
+        logging.error("❌ BOT_TOKEN не найден!")
         return
 
-    # Устанавливаем синюю кнопку «Меню» внизу
-    await setup_bot_commands(bot)
+    # 1. Устанавливаем команды (меню)
+    try:
+        await bot.set_my_commands([BotCommand(command="start", description="🚀 Начать сначала")])
+    except Exception as e:
+        logging.error(f"Ошибка установки команд: {e}")
 
+    # 2. Запускаем веб-сервер (для Render)
     app = web.Application()
-    app.router.add_get("/", handle)
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     
-    print(f"✅ Сервер запущен на порту {port}. Бот работает!")
-    await dp.start_polling(bot)
+    logging.info(f"✅ Сервер запущен на порту {port}")
+
+    # 3. Запускаем бота
+    try:
+        logging.info("🚀 Запуск Polling...")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logging.error(f"❌ Критическая ошибка при работе бота: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())

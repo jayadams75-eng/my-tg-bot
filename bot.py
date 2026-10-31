@@ -7,7 +7,9 @@ from datetime import datetime
 from aiohttp import web, ClientSession, ClientTimeout
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, BotCommand
+from aiogram.types import (
+    Message, CallbackQuery, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+)
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -251,6 +253,68 @@ async def mark_answered(cb: CallbackQuery, choice_text: str):
             pass
 
 
+def build_keyboard(q_index: int, options: dict, selected: list) -> InlineKeyboardMarkup:
+    """Клавиатура вопроса: варианты-переключатели (✅ у выбранных), «Свой вариант», «Готово»."""
+    rows, row = [], []
+    for code, opt_text in options.items():
+        letter = opt_text.split(".")[0]
+        mark = "✅ " if code in selected else ""
+        # В callback_data зашит номер вопроса: старые/повторные нажатия не собьют ответы
+        row.append(InlineKeyboardButton(
+            text=f"{mark}Вариант {letter}", callback_data=f"ans:{q_index}:{code}"
+        ))
+        if len(row) == 2:  # По 2 кнопки в ряд
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✏️ Свой вариант", callback_data=f"ans:{q_index}:custom")])
+    rows.append([InlineKeyboardButton(text="➡️ Готово", callback_data=f"done:{q_index}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def record_answer(chat_id: int, state: FSMContext, custom_text: str = None):
+    """Сохраняет ответ на текущий вопрос (выбранные варианты + свой текст),
+    убирает кнопки у вопроса и переходит к следующему."""
+    data = await state.get_data()
+    q_index = data.get("q_index", 0)
+    branch = data.get("branch")
+    questions = SOLO_QUESTIONS if branch == "solo" else TEAM_QUESTIONS
+    options = questions[q_index]["options"]
+    selected = data.get("selected", [])
+
+    # Варианты в порядке их показа в вопросе, а не в порядке нажатия
+    parts = [text for code, text in options.items() if code in selected]
+    if custom_text:
+        parts.append(f"Свой вариант: {custom_text}")
+    answer = parts[0] if len(parts) == 1 else "\n".join(f"• {p}" for p in parts)
+
+    answers = list(data.get("answers", []))
+    answers.append(answer)
+
+    await state.set_state(Diag.answering_questions)
+    await state.update_data(answers=answers, q_index=q_index + 1, selected=[])
+
+    # Убираем кнопки у отвеченного вопроса и показываем итоговый ответ
+    msg_id = data.get("q_msg_id")
+    if msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=f"{data.get('q_html', '')}\n\n✅ <b>Ваш ответ:</b>\n{html.escape(answer)}",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось отметить ответ в сообщении: {e}")
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
+            except Exception:
+                pass
+
+    await send_next_question(chat_id, state)
+
+
 # ─── ЛОГИКА ОПРОСА ──────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -347,20 +411,19 @@ async def send_next_question(chat_id: int, state: FSMContext):
     q_data = questions[q_index]
 
     text = f"<b>Вопрос {q_index + 1} из {len(questions)}:</b>\n"
-    text += f"<b>{q_data['title']}</b>\n\n"
+    text += f"<b>{q_data['title']}</b>\n"
+    text += "<i>Можно выбрать несколько вариантов, затем нажмите «➡️ Готово».</i>\n\n"
 
-    kb = InlineKeyboardBuilder()
-
-    for code, opt_text in q_data["options"].items():
+    for opt_text in q_data["options"].values():
         text += f"{opt_text}\n\n"
-        letter = opt_text.split(".")[0]
-        # В callback_data зашит номер вопроса: старые/повторные нажатия не собьют ответы
-        kb.button(text=f"Вариант {letter}", callback_data=f"ans:{q_index}:{code}")
 
-    kb.button(text="✏️ Свой вариант", callback_data=f"ans:{q_index}:custom")
-    kb.adjust(2)  # По 2 кнопки в ряд
-
-    await bot.send_message(chat_id, text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    sent = await bot.send_message(
+        chat_id, text,
+        reply_markup=build_keyboard(q_index, q_data["options"], []),
+        parse_mode="HTML"
+    )
+    # Запоминаем сообщение с вопросом, чтобы потом убрать кнопки и показать ответ
+    await state.update_data(selected=[], q_msg_id=sent.message_id, q_html=text.rstrip())
 
 
 @dp.callback_query(
@@ -395,34 +458,63 @@ async def handle_answer(cb: CallbackQuery, state: FSMContext):
         await state.set_state(Diag.waiting_custom_answer)
         return
 
-    selected_text = questions[q_index]["options"].get(code)
-    if selected_text is None:
+    options = questions[q_index]["options"]
+    if code not in options:
         await cb.answer()
         return
 
+    # Переключаем вариант: нажали первый раз — выбран, второй — снят
+    selected = list(data.get("selected", []))
+    if code in selected:
+        selected.remove(code)
+    else:
+        selected.append(code)
+
     await cb.answer()
-
-    answers = list(data.get("answers", []))
-    answers.append(selected_text)
-
     await state.set_state(Diag.answering_questions)
-    await state.update_data(answers=answers, q_index=q_index + 1)
+    await state.update_data(selected=selected)
 
-    await mark_answered(cb, selected_text)
-    await send_next_question(cb.from_user.id, state)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=build_keyboard(q_index, options, selected))
+    except Exception as e:
+        logging.warning(f"Не удалось обновить кнопки: {e}")
+
+
+@dp.callback_query(
+    StateFilter(Diag.answering_questions, Diag.waiting_custom_answer),
+    F.data.startswith("done:")
+)
+async def handle_done(cb: CallbackQuery, state: FSMContext):
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+
+    data = await state.get_data()
+    q_index = data.get("q_index", 0)
+    branch = data.get("branch")
+    questions = SOLO_QUESTIONS if branch == "solo" else TEAM_QUESTIONS
+
+    if idx != q_index or q_index >= len(questions):
+        await cb.answer("Этот вопрос уже пройден.")
+        return
+
+    if not data.get("selected"):
+        await cb.answer(
+            "Выберите хотя бы один вариант или нажмите «✏️ Свой вариант».",
+            show_alert=True
+        )
+        return
+
+    await cb.answer()
+    await record_answer(cb.from_user.id, state)
 
 
 @dp.message(Diag.waiting_custom_answer, F.text)
 async def process_custom_answer(message: Message, state: FSMContext):
-    data = await state.get_data()
-    q_index = data.get("q_index", 0)
-    answers = list(data.get("answers", []))
-    answers.append(f"Свой вариант: {message.text}")
-
-    await state.set_state(Diag.answering_questions)
-    await state.update_data(answers=answers, q_index=q_index + 1)
-
-    await send_next_question(message.chat.id, state)
+    # Свой вариант добавляется к уже выбранным кнопками и завершает вопрос
+    await record_answer(message.chat.id, state, custom_text=message.text)
 
 
 # ─── ФИНАЛ ──────────────────────────────────────────────
@@ -456,8 +548,10 @@ async def finish_diagnostic(chat_id: int, state: FSMContext):
         html_lines += ["", "📋 <b>ОТВЕТЫ:</b>"]
         plain_lines += ["", "📋 ОТВЕТЫ:"]
         for i, ans in enumerate(answers, 1):
-            html_lines.append(f"<b>В{i}:</b> {html.escape(ans)}")
-            plain_lines.append(f"В{i}: {ans}")
+            # Если выбрано несколько вариантов, список начинается с новой строки
+            sep = "\n" if "\n" in ans else " "
+            html_lines.append(f"<b>В{i}:</b>{sep}{html.escape(ans)}")
+            plain_lines.append(f"В{i}:{sep}{ans}")
 
         html_msg = "\n".join(html_lines)
         plain_msg = "\n".join(plain_lines)
